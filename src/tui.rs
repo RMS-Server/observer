@@ -19,7 +19,7 @@ use crate::core::{self, Config, Event as SEvent, Lang, MatchMode, RuleDef, Sessi
 use crate::strings::{L10n, render_tpl1, render_tpl2, t};
 
 const LOG_CAP: usize = 5000;
-const DEFAULT_CFG: &str = "./wrapper.json";
+const DEFAULT_CFG: &str = "./observer.json";
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -381,16 +381,10 @@ impl App {
         }
     }
 
-    fn save_config(&mut self) {
-        match core::save_config(&self.config_path, &self.config) {
-            Ok(_) => {
-                let msg = render_tpl1(self.tr().tpl_saved_config_to, &self.config_path);
-                self.info(msg);
-            }
-            Err(e) => {
-                let msg = render_tpl1(self.tr().tpl_save_failed, &e.to_string());
-                self.error(msg);
-            }
+    fn autosave(&mut self) {
+        if let Err(e) = core::save_config(&self.config_path, &self.config) {
+            let msg = render_tpl1(self.tr().tpl_save_failed, &e.to_string());
+            self.error(msg);
         }
     }
 
@@ -403,6 +397,7 @@ impl App {
             }
             let msg = render_tpl1(self.tr().tpl_deleted_rule, &pat);
             self.info(msg);
+            self.autosave();
         }
     }
 
@@ -411,6 +406,7 @@ impl App {
             Lang::En => Lang::Zh,
             Lang::Zh => Lang::En,
         };
+        self.autosave();
     }
 
     fn run(&mut self, terminal: &mut Term) -> io::Result<()> {
@@ -533,7 +529,6 @@ impl App {
             KeyCode::Char('c') => {
                 self.modal = Some(Modal::ConfigForm(ConfigForm::new(&self.config)));
             }
-            KeyCode::Char('w') => self.save_config(),
             KeyCode::Char('L') => self.toggle_lang(),
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
             KeyCode::Up => match self.focus {
@@ -601,6 +596,7 @@ impl App {
                             }
                             self.modal = None;
                             self.info(self.tr().rule_saved_hint.into());
+                            self.autosave();
                         }
                         Err(e) => self.modal = Some(Modal::Error(e)),
                     }
@@ -655,6 +651,7 @@ impl App {
                             self.config = cfg;
                             self.modal = None;
                             self.info(self.tr().config_updated_hint.into());
+                            self.autosave();
                         }
                         Err(e) => self.modal = Some(Modal::Error(e)),
                     }
@@ -978,8 +975,8 @@ fn wrap_log_line(l: &LogLine, width: usize) -> Vec<Line<'static>> {
         LogKind::Out => ("[OUT] ", Color::White),
         LogKind::Err => ("[ERR] ", Color::Red),
         LogKind::Rule => ("[RULE] ", Color::Magenta),
-        LogKind::Info => ("[wrapper] ", Color::Cyan),
-        LogKind::Error => ("[wrapper ERR] ", Color::Red),
+        LogKind::Info => ("[observer] ", Color::Cyan),
+        LogKind::Error => ("[observer ERR] ", Color::Red),
     };
     let tag_w = tag.chars().count();
     if width <= tag_w + 1 {
@@ -1052,7 +1049,6 @@ fn draw_hints(f: &mut ratatui::Frame, area: Rect, app: &App) {
         hint("a", l.hint_add),
         hint("e", l.hint_edit),
         hint("d", l.hint_delete),
-        hint("w", l.hint_write),
         hint("i", l.hint_input),
         hint("Tab", l.hint_focus),
         hint("L", l.hint_lang),

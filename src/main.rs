@@ -8,14 +8,14 @@ use std::io;
 
 fn usage() -> ! {
     eprintln!(
-        "mc_wrapper - MC server IO wrapper with rule engine\n\n\
+        "observer — MC server wrapper with rule engine\n\n\
          TUI mode (default):\n\
-           mc_wrapper\n\
-           mc_wrapper tui [--config <path>]\n\n\
+           observer\n\
+           observer tui [--config <path>]\n\n\
          Headless mode:\n\
-           mc_wrapper run [--config <path>] [-- <server-cmd> [args...]]\n\
-           mc_wrapper [--config <path>] -- <server-cmd> [args...]\n\
-           mc_wrapper <server-cmd> [args...]\n"
+           observer run [--config <path>] [-- <server-cmd> [args...]]\n\
+           observer [--config <path>] -- <server-cmd> [args...]\n\
+           observer <server-cmd> [args...]\n"
     );
     std::process::exit(2);
 }

@@ -13,7 +13,7 @@ pub fn run(config_path: Option<&str>, server_cmd_override: Vec<String>) -> io::R
         config.server_cmd = server_cmd_override;
     }
     if config.server_cmd.is_empty() {
-        eprintln!("[wrapper] no server_cmd — set it in config or pass after --");
+        eprintln!("[observer] no server_cmd — set it in config or pass after --");
         std::process::exit(2);
     }
 
@@ -48,7 +48,7 @@ pub fn run(config_path: Option<&str>, server_cmd_override: Vec<String>) -> io::R
                 Event::Exited(code) => {
                     let _ = writeln!(
                         out,
-                        "[wrapper] server exited: code={:?}",
+                        "[observer] server exited: code={:?}",
                         code.unwrap_or(-1)
                     );
                     let _ = out.flush();
@@ -61,7 +61,7 @@ pub fn run(config_path: Option<&str>, server_cmd_override: Vec<String>) -> io::R
     });
 
     eprintln!(
-        "[wrapper] loaded {rule_count} rule(s). type server commands; `:quit` closes server stdin; Ctrl-C kills wrapper."
+        "[observer] loaded {rule_count} rule(s). type server commands; `:quit` closes server stdin; Ctrl-C kills observer."
     );
 
     let stdin = io::stdin();
@@ -70,22 +70,22 @@ pub fn run(config_path: Option<&str>, server_cmd_override: Vec<String>) -> io::R
         input.clear();
         match stdin.lock().read_line(&mut input) {
             Ok(0) => {
-                eprintln!("[wrapper] user stdin closed; server keeps running (rules still active)");
+                eprintln!("[observer] user stdin closed; server keeps running (rules still active)");
                 break;
             }
             Ok(_) => {
                 if input.trim() == ":quit" {
-                    eprintln!("[wrapper] :quit -> closing server stdin");
+                    eprintln!("[observer] :quit -> closing server stdin");
                     session.close_stdin();
                     break;
                 }
                 if !session.send_cmd(&input) {
-                    eprintln!("[wrapper] server stdin unavailable");
+                    eprintln!("[observer] server stdin unavailable");
                     break;
                 }
             }
             Err(e) => {
-                eprintln!("[wrapper] stdin read failed: {e}");
+                eprintln!("[observer] stdin read failed: {e}");
                 break;
             }
         }

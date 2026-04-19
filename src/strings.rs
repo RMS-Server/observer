@@ -27,7 +27,6 @@ pub struct L10n {
     pub hint_add: &'static str,
     pub hint_edit: &'static str,
     pub hint_delete: &'static str,
-    pub hint_write: &'static str,
     pub hint_input: &'static str,
     pub hint_focus: &'static str,
     pub hint_lang: &'static str,
@@ -71,7 +70,6 @@ pub struct L10n {
     pub tpl_loaded_config: &'static str,       // "loaded config: {p}"
     pub tpl_started_at: &'static str,          // "started: {cmd} (dir={dir})"
     pub tpl_spawn_failed: &'static str,        // "spawn failed: {e}"
-    pub tpl_saved_config_to: &'static str,     // "saved config to {p}"
     pub tpl_save_failed: &'static str,         // "save failed: {e}"
     pub tpl_deleted_rule: &'static str,        // "deleted rule /{p}/"
     pub tpl_server_exited: &'static str,       // "server exited (code={c})"
@@ -89,7 +87,7 @@ pub struct L10n {
 }
 
 pub const EN: L10n = L10n {
-    banner: " mc_wrapper ",
+    banner: " Observer ",
     running: "● running",
     stopped: "○ stopped",
     config_prefix: "  config: ",
@@ -115,7 +113,6 @@ pub const EN: L10n = L10n {
     hint_add: "dd ",
     hint_edit: "dit ",
     hint_delete: "el ",
-    hint_write: "rite ",
     hint_input: "nput ",
     hint_focus: " focus ",
     hint_lang: " 中/EN ",
@@ -144,7 +141,7 @@ pub const EN: L10n = L10n {
 
     help_title: "Help",
     help_body: &[
-        "mc_wrapper TUI",
+        "Observer — MC server wrapper with rule engine",
         "",
         "s        start server",
         "S        stop server (sends `stop`)",
@@ -152,14 +149,13 @@ pub const EN: L10n = L10n {
         "a        add rule",
         "e        edit selected rule",
         "d        delete selected rule",
-        "w        write config to disk",
         "i / /    focus input field",
         "Tab      cycle focus (Input / Rules / Log)",
         "↑/↓      navigate (Rules: select, Log: scroll)",
         "Enter    in Input: send to server",
         "L        toggle language (English / 中文)",
         ":quit    close server stdin (lets server finish)",
-        "Ctrl-C   quit wrapper",
+        "Ctrl-C   quit observer",
     ],
     press_any_to_close: "press any key to close",
 
@@ -175,8 +171,7 @@ pub const EN: L10n = L10n {
     tpl_loaded_config: "loaded config: {}",
     tpl_started_at: "started: {} (dir={})",
     tpl_spawn_failed: "spawn failed: {}",
-    tpl_saved_config_to: "saved config to {}",
-    tpl_save_failed: "save failed: {}",
+    tpl_save_failed: "autosave failed: {}",
     tpl_deleted_rule: "deleted rule /{}/",
     tpl_server_exited: "server exited (code={})",
     sent_stop: "sent `stop`",
@@ -188,12 +183,12 @@ pub const EN: L10n = L10n {
     no_server_hint: "no server running — press `s` to start",
     no_rules_to_edit: "no rules to edit — press `a` to add",
     no_rules_to_delete: "no rules to delete",
-    rule_saved_hint: "rule saved (press `w` to persist)",
-    config_updated_hint: "server config updated (press `w` to persist)",
+    rule_saved_hint: "rule saved",
+    config_updated_hint: "server config updated",
 };
 
 pub const ZH: L10n = L10n {
-    banner: " mc_wrapper ",
+    banner: " Observer ",
     running: "● 运行中",
     stopped: "○ 已停止",
     config_prefix: "  配置: ",
@@ -219,7 +214,6 @@ pub const ZH: L10n = L10n {
     hint_add: "添加 ",
     hint_edit: "编辑 ",
     hint_delete: "删除 ",
-    hint_write: "保存 ",
     hint_input: "输入 ",
     hint_focus: " 焦点 ",
     hint_lang: " 中/EN ",
@@ -248,7 +242,7 @@ pub const ZH: L10n = L10n {
 
     help_title: "帮助",
     help_body: &[
-        "mc_wrapper TUI",
+        "Observer — 带规则引擎的 MC 服务器 wrapper",
         "",
         "s        启动服务器",
         "S        停止服务器 (发送 `stop`)",
@@ -256,14 +250,13 @@ pub const ZH: L10n = L10n {
         "a        添加规则",
         "e        编辑选中的规则",
         "d        删除选中的规则",
-        "w        保存配置到磁盘",
         "i / /    聚焦输入框",
         "Tab      切换焦点 (输入 / 规则 / 日志)",
         "↑/↓      导航 (规则: 选中, 日志: 滚动)",
         "Enter    在输入框内: 发送到服务器",
         "L        切换语言 (English / 中文)",
         ":quit    关闭服务器的 stdin (让服务器自己收尾)",
-        "Ctrl-C   退出 wrapper",
+        "Ctrl-C   退出 observer",
     ],
     press_any_to_close: "按任意键关闭",
 
@@ -279,8 +272,7 @@ pub const ZH: L10n = L10n {
     tpl_loaded_config: "已加载配置: {}",
     tpl_started_at: "已启动: {} (目录={})",
     tpl_spawn_failed: "启动失败: {}",
-    tpl_saved_config_to: "已保存配置到 {}",
-    tpl_save_failed: "保存失败: {}",
+    tpl_save_failed: "自动保存失败: {}",
     tpl_deleted_rule: "已删除规则 /{}/",
     tpl_server_exited: "服务器已退出 (退出码={})",
     sent_stop: "已发送 `stop`",
@@ -292,8 +284,8 @@ pub const ZH: L10n = L10n {
     no_server_hint: "没有运行中的服务器 — 按 `s` 启动",
     no_rules_to_edit: "没有规则可编辑 — 按 `a` 新增",
     no_rules_to_delete: "没有规则可删除",
-    rule_saved_hint: "规则已保存 (按 `w` 写盘持久化)",
-    config_updated_hint: "服务器配置已更新 (按 `w` 写盘持久化)",
+    rule_saved_hint: "规则已保存",
+    config_updated_hint: "服务器配置已更新",
 };
 
 pub fn t(lang: Lang) -> &'static L10n {
