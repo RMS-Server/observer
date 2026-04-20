@@ -1,11 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::{ChildStdin, Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -37,124 +38,73 @@ fn default_lang() -> Lang {
     detect_lang()
 }
 
-#[derive(Serialize, Deserialize, Clone, Default, Debug)]
+fn default_scenarios_dir() -> PathBuf {
+    PathBuf::from("./scenarios")
+}
+
+fn default_results_dir() -> PathBuf {
+    PathBuf::from("./results")
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     #[serde(default)]
     pub server_dir: Option<String>,
     #[serde(default)]
     pub server_cmd: Vec<String>,
-    #[serde(default)]
-    pub rules: Vec<RuleDef>,
     #[serde(default = "default_lang")]
     pub lang: Lang,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum MatchMode {
-    Contains,
-    Exact,
-    Glob,
-    Regex,
-}
-
-fn default_match_mode() -> MatchMode {
-    MatchMode::Regex
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct RuleDef {
-    pub pattern: String,
-    pub commands: Vec<String>,
+    #[serde(default = "default_scenarios_dir")]
+    pub scenarios_dir: PathBuf,
     #[serde(default)]
-    pub once: bool,
-    #[serde(default)]
-    pub delay_ms: u64,
-    #[serde(default)]
-    pub gap_ms: u64,
-    #[serde(default = "default_match_mode", rename = "match")]
-    pub match_mode: MatchMode,
+    pub selected_scenarios: Vec<String>,
+    #[serde(default = "default_results_dir")]
+    pub results_dir: PathBuf,
 }
 
-impl Default for RuleDef {
+impl Default for Config {
     fn default() -> Self {
         Self {
-            pattern: String::new(),
-            commands: Vec::new(),
-            once: false,
-            delay_ms: 0,
-            gap_ms: 0,
-            match_mode: MatchMode::Contains,
+            server_dir: None,
+            server_cmd: Vec::new(),
+            lang: default_lang(),
+            scenarios_dir: default_scenarios_dir(),
+            selected_scenarios: Vec::new(),
+            results_dir: default_results_dir(),
         }
     }
 }
 
-struct CompiledRule {
-    re: Regex,
-    def: RuleDef,
-    fired: bool,
-}
-
-pub fn validate_rule(def: &RuleDef) -> Result<(), String> {
-    build_matcher(def).map(|_| ())
-}
-
-pub fn validate_rules(defs: &[RuleDef]) -> Result<(), String> {
-    for d in defs {
-        validate_rule(d)?;
-    }
-    Ok(())
-}
-
-fn build_matcher(def: &RuleDef) -> Result<Regex, String> {
-    let pat = match def.match_mode {
-        MatchMode::Contains => format!("(?i){}", regex::escape(&def.pattern)),
-        MatchMode::Exact => format!("^{}$", regex::escape(&def.pattern)),
-        MatchMode::Glob => {
-            let esc = regex::escape(&def.pattern);
-            let converted = esc.replace(r"\*", ".*").replace(r"\?", ".");
-            format!("^{}$", converted)
-        }
-        MatchMode::Regex => def.pattern.clone(),
-    };
-    Regex::new(&pat).map_err(|e| {
-        format!(
-            "bad {:?} pattern {:?}: {e}",
-            def.match_mode, def.pattern
-        )
-    })
-}
-
-fn build_compiled(defs: &[RuleDef]) -> Result<Vec<CompiledRule>, String> {
-    defs.iter()
-        .map(|d| {
-            build_matcher(d).map(|re| CompiledRule {
-                re,
-                def: d.clone(),
-                fired: false,
-            })
-        })
-        .collect()
+#[derive(Debug, Clone)]
+pub struct Sample {
+    pub ts: SystemTime,
+    pub scenario: String,
+    pub metrics: HashMap<String, f64>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Event {
     Stdout(String),
     Stderr(String),
-    RuleMatch {
-        pattern: String,
-        count: usize,
-        delay_ms: u64,
-        gap_ms: u64,
-    },
-    RuleSent(String),
     Exited(Option<i32>),
+    StepStart(String),
+    StepDone(String),
+    ScenarioStart(String),
+    ScenarioDone {
+        name: String,
+        samples: usize,
+    },
+    Sample(Sample),
+    RunnerInfo(String),
+    RunnerError(String),
 }
 
 type Writer = Arc<Mutex<Option<ChildStdin>>>;
+type ChildHandle = Arc<Mutex<Option<Child>>>;
 
 pub struct Session {
     writer: Writer,
+    child: ChildHandle,
 }
 
 impl Session {
@@ -165,62 +115,79 @@ impl Session {
                 "server_cmd is empty",
             ));
         }
-        let rules = build_compiled(&config.rules)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let rules = Arc::new(Mutex::new(rules));
 
         let mut cmd = Command::new(&config.server_cmd[0]);
         cmd.args(&config.server_cmd[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(dir) = &config.server_dir {
-            if !dir.is_empty() {
-                cmd.current_dir(dir);
-            }
+        if let Some(dir) = &config.server_dir
+            && !dir.is_empty()
+        {
+            cmd.current_dir(dir);
         }
         let mut child = cmd.spawn()?;
 
         let writer: Writer = Arc::new(Mutex::new(Some(child.stdin.take().expect("stdin"))));
         let stdout = child.stdout.take().expect("stdout");
         let stderr = child.stderr.take().expect("stderr");
+        let child_handle: ChildHandle = Arc::new(Mutex::new(Some(child)));
 
         let (ev_tx, ev_rx) = mpsc::channel();
 
         {
             let tx = ev_tx.clone();
-            let rules = Arc::clone(&rules);
-            let writer = Arc::clone(&writer);
             thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
-                    let _ = tx.send(Event::Stdout(line.clone()));
-                    evaluate(&rules, &line, &writer, &tx);
+                    if tx.send(Event::Stdout(line)).is_err() {
+                        break;
+                    }
                 }
             });
         }
         {
             let tx = ev_tx.clone();
-            let rules = Arc::clone(&rules);
-            let writer = Arc::clone(&writer);
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    let _ = tx.send(Event::Stderr(line.clone()));
-                    evaluate(&rules, &line, &writer, &tx);
+                    if tx.send(Event::Stderr(line)).is_err() {
+                        break;
+                    }
                 }
             });
         }
         {
             let tx = ev_tx.clone();
+            let ch = Arc::clone(&child_handle);
             thread::spawn(move || {
-                let status = child.wait();
-                let code = status.ok().and_then(|s| s.code());
-                let _ = tx.send(Event::Exited(code));
+                loop {
+                    let status = {
+                        let Ok(mut g) = ch.lock() else { return };
+                        match g.as_mut() {
+                            Some(c) => c.try_wait(),
+                            None => return, // killed via Session::kill
+                        }
+                    };
+                    match status {
+                        Ok(Some(s)) => {
+                            let _ = tx.send(Event::Exited(s.code()));
+                            return;
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(200)),
+                        Err(_) => return,
+                    }
+                }
             });
         }
 
-        Ok((Session { writer }, ev_rx))
+        Ok((
+            Session {
+                writer,
+                child: child_handle,
+            },
+            ev_rx,
+        ))
     }
 
     pub fn send_cmd(&self, cmd: &str) -> bool {
@@ -228,7 +195,188 @@ impl Session {
     }
 
     pub fn close_stdin(&self) {
-        self.writer.lock().unwrap().take();
+        if let Ok(mut g) = self.writer.lock() {
+            g.take();
+        }
+    }
+
+    /// Kill the server process and wait for it. Safe to call multiple times.
+    pub fn kill(&self) {
+        self.close_stdin();
+        let mut g = match self.child.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(mut c) = g.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Centralized session lifecycle. Cheap to clone (shared Arcs).
+///
+/// Responsibilities:
+/// - spawn the server on request (`start`) and kill it on request (`kill`)
+/// - forward session events to a single consumer channel (owned by the app)
+/// - let runner and TUI query/drive the server through the same handle
+///
+/// The `starting` flag serializes concurrent `start()` calls: it's set via CAS
+/// before `Session::spawn` begins and cleared once the spawn succeeds or fails.
+/// Without it, two threads could both pass an early "is Some?" check and spawn
+/// two MC processes, orphaning one.
+#[derive(Clone)]
+pub struct SessionCtrl {
+    inner: Arc<Mutex<Option<Arc<Session>>>>,
+    starting: Arc<std::sync::atomic::AtomicBool>,
+    config: Arc<Mutex<Config>>,
+    ev_out: mpsc::Sender<Event>,
+}
+
+pub enum StartOutcome {
+    Started,
+    AlreadyRunning,
+}
+
+impl SessionCtrl {
+    pub fn new(config: Config) -> (Self, mpsc::Receiver<Event>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Self {
+                inner: Arc::new(Mutex::new(None)),
+                starting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                config: Arc::new(Mutex::new(config)),
+                ev_out: tx,
+            },
+            rx,
+        )
+    }
+
+    pub fn update_config(&self, cfg: Config) {
+        if let Ok(mut g) = self.config.lock() {
+            *g = cfg;
+        }
+    }
+
+    pub fn snapshot_config(&self) -> Config {
+        match self.config.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.starting.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.inner.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
+    pub fn send_cmd(&self, cmd: &str) -> bool {
+        let s = self.session();
+        match s {
+            Some(s) => s.send_cmd(cmd),
+            None => false,
+        }
+    }
+
+    pub fn close_stdin(&self) {
+        if let Some(s) = self.session() {
+            s.close_stdin();
+        }
+    }
+
+    pub fn start(&self) -> Result<StartOutcome, String> {
+        use std::sync::atomic::Ordering;
+        // Only one thread may be in the spawn-in-progress state at a time.
+        if self
+            .starting
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(StartOutcome::AlreadyRunning);
+        }
+        // Guard clears `starting` on every path out of this function, even panics.
+        struct StartingGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StartingGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = StartingGuard(&self.starting);
+
+        {
+            let g = self
+                .inner
+                .lock()
+                .map_err(|_| "session lock poisoned".to_string())?;
+            if g.is_some() {
+                return Ok(StartOutcome::AlreadyRunning);
+            }
+        }
+        let cfg = self.snapshot_config();
+        let (session, events) = Session::spawn(&cfg).map_err(|e| e.to_string())?;
+        let session = Arc::new(session);
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| "session lock poisoned".to_string())?;
+            *g = Some(Arc::clone(&session));
+        }
+        let inner = Arc::clone(&self.inner);
+        let tx = self.ev_out.clone();
+        let my_session = Arc::clone(&session);
+        thread::spawn(move || {
+            for ev in events {
+                let is_exited = matches!(ev, Event::Exited(_));
+                if tx.send(ev).is_err() {
+                    break;
+                }
+                if is_exited {
+                    break;
+                }
+            }
+            // Clear `inner` if (and only if) the current occupant is the session
+            // this forwarder was responsible for. Prevents a stale forwarder from
+            // wiping a freshly-started new session.
+            if let Ok(mut g) = inner.lock()
+                && g.as_ref()
+                    .map(|cur| Arc::ptr_eq(cur, &my_session))
+                    .unwrap_or(false)
+            {
+                g.take();
+            }
+        });
+        Ok(StartOutcome::Started)
+    }
+
+    /// Kill the running server (if any). Idempotent.
+    pub fn kill(&self) {
+        let taken = {
+            let mut g = match self.inner.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            g.take()
+        };
+        if let Some(s) = taken {
+            s.kill();
+        }
+    }
+
+    fn session(&self) -> Option<Arc<Session>> {
+        match self.inner.lock() {
+            Ok(g) => g.clone(),
+            Err(_) => None,
+        }
     }
 }
 
@@ -247,70 +395,15 @@ fn write_line(writer: &Writer, cmd: &str) -> bool {
     true
 }
 
-fn evaluate(
-    rules: &Arc<Mutex<Vec<CompiledRule>>>,
-    line: &str,
-    writer: &Writer,
-    tx: &mpsc::Sender<Event>,
-) {
-    let triggered: Vec<(String, Vec<String>, u64, u64)> = {
-        let mut g = rules.lock().unwrap();
-        let mut out = Vec::new();
-        for r in g.iter_mut() {
-            if r.def.once && r.fired {
-                continue;
-            }
-            if r.re.is_match(line) {
-                out.push((
-                    r.def.pattern.clone(),
-                    r.def.commands.clone(),
-                    r.def.delay_ms,
-                    r.def.gap_ms,
-                ));
-                if r.def.once {
-                    r.fired = true;
-                }
-            }
-        }
-        out
-    };
-
-    for (pattern, cmds, delay_ms, gap_ms) in triggered {
-        let writer = Arc::clone(writer);
-        let tx = tx.clone();
-        thread::spawn(move || {
-            let _ = tx.send(Event::RuleMatch {
-                pattern,
-                count: cmds.len(),
-                delay_ms,
-                gap_ms,
-            });
-            if delay_ms > 0 {
-                thread::sleep(Duration::from_millis(delay_ms));
-            }
-            for (i, c) in cmds.into_iter().enumerate() {
-                if i > 0 && gap_ms > 0 {
-                    thread::sleep(Duration::from_millis(gap_ms));
-                }
-                if !write_line(&writer, &c) {
-                    break;
-                }
-                let _ = tx.send(Event::RuleSent(c));
-            }
-        });
-    }
-}
-
 pub fn load_config(path: &str) -> io::Result<Config> {
     let text = fs::read_to_string(path)?;
     let cfg: Config = serde_json::from_str(&text)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("config parse: {e}")))?;
-    validate_rules(&cfg.rules).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(cfg)
 }
 
 pub fn save_config(path: &str, config: &Config) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e}")))?;
+        .map_err(|e| io::Error::other(format!("{e}")))?;
     fs::write(path, json)
 }

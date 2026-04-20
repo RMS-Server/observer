@@ -1,0 +1,19 @@
+# example_tps_stress.mcb
+# Full lifecycle: start server → wait for ready → sample MSPT → stop.
+#
+# Pattern syntax:
+#   - default: literal substring match; `(` `[` `.` are not special
+#   - `{}`: placeholder that grabs a decimal number
+#   - `re:<regex>`: switch to full regex (advanced)
+
+start                               # launch server using config.server_cmd
+wait   Done (                       # wait for "Done (x.xxx)s!" fabric/paper startup line
+send   /tick rate 20
+sleep  2s
+
+loop 30s every 1s
+    send    /tick query rate
+    grab    mspt  Average tick time: {} ms
+end
+
+stop                                # send `stop` and wait for exit

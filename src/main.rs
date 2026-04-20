@@ -1,5 +1,8 @@
 mod cli;
 mod core;
+mod export;
+mod runner;
+mod scenario;
 mod strings;
 mod tui;
 
@@ -8,14 +11,13 @@ use std::io;
 
 fn usage() -> ! {
     eprintln!(
-        "observer — MC server wrapper with rule engine\n\n\
+        "observer — scripted MC benchmark runner\n\n\
          TUI mode (default):\n\
            observer\n\
            observer tui [--config <path>]\n\n\
-         Headless mode:\n\
-           observer run [--config <path>] [-- <server-cmd> [args...]]\n\
-           observer [--config <path>] -- <server-cmd> [args...]\n\
-           observer <server-cmd> [args...]\n"
+         Headless run (executes .mcb scenarios, exports CSV+JSON, exits):\n\
+           observer run [--config <path>] [scenario-name ...]\n\n\
+         If no scenario names are given, runs `selected_scenarios` from config.\n"
     );
     std::process::exit(2);
 }
@@ -28,8 +30,13 @@ fn main() -> io::Result<()> {
     }
     match raw[0].as_str() {
         "tui" => {
+            let cfg = parse_config_flag(&raw[1..]);
+            tui::run(cfg.as_deref())
+        }
+        "run" => {
             let rest = &raw[1..];
-            let mut cfg = None;
+            let mut cfg: Option<String> = None;
+            let mut scenarios: Vec<String> = Vec::new();
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -42,47 +49,42 @@ fn main() -> io::Result<()> {
                         cfg = Some(rest[i].clone());
                     }
                     "-h" | "--help" => usage(),
-                    _ => {
-                        eprintln!("unknown tui arg: {}", rest[i]);
+                    other if other.starts_with('-') => {
+                        eprintln!("unknown flag: {other}");
                         usage();
                     }
+                    _ => scenarios.push(rest[i].clone()),
                 }
                 i += 1;
             }
-            tui::run(cfg.as_deref())
+            cli::run_headless(cfg.as_deref(), scenarios)
         }
-        "run" => dispatch_headless(&raw[1..]),
         "-h" | "--help" => usage(),
-        _ => dispatch_headless(&raw),
+        _ => {
+            eprintln!("unknown command: {}", raw[0]);
+            usage();
+        }
     }
 }
 
-fn dispatch_headless(args: &[String]) -> io::Result<()> {
-    let sep = args.iter().position(|a| a == "--");
-    let (wrapper, server): (&[String], Vec<String>) = match sep {
-        Some(i) => (&args[..i], args[i + 1..].to_vec()),
-        None => (&[][..], args.to_vec()),
-    };
-
+fn parse_config_flag(args: &[String]) -> Option<String> {
     let mut cfg = None;
-    let mut i = 0;
-    while i < wrapper.len() {
-        match wrapper[i].as_str() {
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        match a.as_str() {
             "-c" | "--config" => {
-                i += 1;
-                if i >= wrapper.len() {
+                let Some(v) = iter.next() else {
                     eprintln!("--config needs a path");
                     usage();
-                }
-                cfg = Some(wrapper[i].clone());
+                };
+                cfg = Some(v.clone());
             }
             "-h" | "--help" => usage(),
             other => {
-                eprintln!("unknown flag: {other}");
+                eprintln!("unknown arg: {other}");
                 usage();
             }
         }
-        i += 1;
     }
-    cli::run(cfg.as_deref(), server)
+    cfg
 }

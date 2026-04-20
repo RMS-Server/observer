@@ -1,6 +1,8 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Stdout, stdout};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -15,8 +17,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::core::{self, Config, Event as SEvent, Lang, MatchMode, RuleDef, Session};
-use crate::strings::{L10n, render_tpl1, render_tpl2, t};
+use crate::core::{self, Config, Event as SEvent, Lang, Sample, SessionCtrl, StartOutcome};
+use crate::export;
+use crate::runner::{self, RunnerHandle};
+use crate::scenario::{self, Scenario, ScenarioLoadError};
+use crate::strings::{L10n, PRESETS, render_tpl1, render_tpl2, t};
 
 const LOG_CAP: usize = 5000;
 const DEFAULT_CFG: &str = "./observer.json";
@@ -26,7 +31,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 #[derive(Clone, Copy, PartialEq)]
 enum Focus {
     Input,
-    Rules,
+    Scenarios,
     Log,
 }
 
@@ -40,125 +45,38 @@ struct LogLine {
 enum LogKind {
     Out,
     Err,
-    Rule,
     Info,
     Error,
+    Step,
+    Sample,
+    Runner,
 }
-
-const RULE_FORM_FIELDS: usize = 6;
-
-struct RuleForm {
-    editing: Option<usize>,
-    field: usize,
-    pattern: String,
-    match_mode: MatchMode,
-    commands: String,
-    once: bool,
-    delay_ms: String,
-    gap_ms: String,
-    pat_cur: usize,
-    cmd_cur: usize,
-    d_cur: usize,
-    g_cur: usize,
-}
-
-impl RuleForm {
-    fn new(editing: Option<usize>, rule: &RuleDef) -> Self {
-        let cmds = rule.commands.join("\n");
-        let delay = rule.delay_ms.to_string();
-        let gap = rule.gap_ms.to_string();
-        Self {
-            editing,
-            field: 0,
-            pat_cur: rule.pattern.len(),
-            cmd_cur: cmds.len(),
-            d_cur: delay.len(),
-            g_cur: gap.len(),
-            pattern: rule.pattern.clone(),
-            match_mode: rule.match_mode,
-            commands: cmds,
-            once: rule.once,
-            delay_ms: delay,
-            gap_ms: gap,
-        }
-    }
-
-    fn new_blank() -> Self {
-        Self::new(None, &RuleDef::default())
-    }
-
-    fn to_rule(&self, lang: Lang) -> Result<RuleDef, String> {
-        let l = t(lang);
-        if self.pattern.is_empty() {
-            return Err(l.err_pattern_empty.into());
-        }
-        let commands: Vec<String> = self
-            .commands
-            .split('\n')
-            .map(|s| s.trim_end_matches('\r').to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if commands.is_empty() {
-            return Err(l.err_commands_empty.into());
-        }
-        if !self.delay_ms.trim().is_empty() && self.delay_ms.trim().parse::<u64>().is_err() {
-            return Err(l.err_delay_not_int.into());
-        }
-        if !self.gap_ms.trim().is_empty() && self.gap_ms.trim().parse::<u64>().is_err() {
-            return Err(l.err_gap_not_int.into());
-        }
-        let def = RuleDef {
-            pattern: self.pattern.clone(),
-            commands,
-            once: self.once,
-            delay_ms: self.delay_ms.trim().parse().unwrap_or(0),
-            gap_ms: self.gap_ms.trim().parse().unwrap_or(0),
-            match_mode: self.match_mode,
-        };
-        core::validate_rule(&def)?;
-        Ok(def)
-    }
-}
-
-const MATCH_MODES: [MatchMode; 4] = [
-    MatchMode::Contains,
-    MatchMode::Exact,
-    MatchMode::Glob,
-    MatchMode::Regex,
-];
-
-fn mode_index(m: MatchMode) -> usize {
-    MATCH_MODES.iter().position(|x| *x == m).unwrap_or(0)
-}
-
-fn mode_label(m: MatchMode) -> &'static str {
-    match m {
-        MatchMode::Contains => "contains",
-        MatchMode::Exact => "exact",
-        MatchMode::Glob => "glob",
-        MatchMode::Regex => "regex",
-    }
-}
-
 
 struct ConfigForm {
     field: usize,
     server_dir: String,
     server_cmd: String,
-    dir_cur: usize,
-    cmd_cur: usize,
+    scenarios_dir: String,
+    results_dir: String,
+    cur: [usize; 4],
 }
+
+const CONFIG_FORM_FIELDS: usize = 4;
 
 impl ConfigForm {
     fn new(cfg: &Config) -> Self {
         let dir = cfg.server_dir.clone().unwrap_or_default();
         let cmd = cfg.server_cmd.join(" ");
+        let sdir = cfg.scenarios_dir.display().to_string();
+        let rdir = cfg.results_dir.display().to_string();
+        let cur = [dir.len(), cmd.len(), sdir.len(), rdir.len()];
         Self {
             field: 0,
-            dir_cur: dir.len(),
-            cmd_cur: cmd.len(),
             server_dir: dir,
             server_cmd: cmd,
+            scenarios_dir: sdir,
+            results_dir: rdir,
+            cur,
         }
     }
 
@@ -173,7 +91,32 @@ impl ConfigForm {
             Some(self.server_dir.clone())
         };
         cfg.server_cmd = cmd_parts;
+        cfg.scenarios_dir = PathBuf::from(
+            if self.scenarios_dir.trim().is_empty() {
+                "./scenarios"
+            } else {
+                self.scenarios_dir.as_str()
+            },
+        );
+        cfg.results_dir = PathBuf::from(if self.results_dir.trim().is_empty() {
+            "./results"
+        } else {
+            self.results_dir.as_str()
+        });
         Ok(())
+    }
+
+    fn field_buf_mut(&mut self) -> (&mut String, &mut usize) {
+        let idx = self.field;
+        let cur_ref = &mut self.cur[idx];
+        let buf = match idx {
+            0 => &mut self.server_dir,
+            1 => &mut self.server_cmd,
+            2 => &mut self.scenarios_dir,
+            3 => &mut self.results_dir,
+            _ => unreachable!(),
+        };
+        (buf, cur_ref)
     }
 }
 
@@ -208,27 +151,63 @@ fn shell_split(s: &str) -> Vec<String> {
 }
 
 enum Modal {
-    RuleForm(RuleForm),
     ConfigForm(ConfigForm),
     Error(String),
     Help,
 }
 
+struct Wizard {
+    page: usize, // 0 welcome, 1 dir, 2 cmd, 3 scenarios
+    dir_buf: String,
+    dir_cur: usize,
+    preset_idx: usize,
+    cmd_buf: String,
+    cmd_cur: usize,
+    cmd_edit_focus: bool, // when page=2, false=presets list, true=cmd input
+    scenario_sel: usize,
+    scenario_selected: HashSet<String>,
+}
+
+impl Wizard {
+    fn new(cfg: &Config, selected: &[String]) -> Self {
+        let dir = cfg.server_dir.clone().unwrap_or_default();
+        let cmd = cfg.server_cmd.join(" ");
+        Self {
+            page: 0,
+            dir_cur: dir.len(),
+            dir_buf: dir,
+            preset_idx: 0,
+            cmd_cur: cmd.len(),
+            cmd_buf: cmd,
+            cmd_edit_focus: false,
+            scenario_sel: 0,
+            scenario_selected: selected.iter().cloned().collect(),
+        }
+    }
+}
+
 struct App {
     config: Config,
     config_path: String,
-    session: Option<Session>,
-    events: Option<mpsc::Receiver<SEvent>>,
+    ctrl: SessionCtrl,
+    events: mpsc::Receiver<SEvent>,
     log: VecDeque<LogLine>,
     log_scroll: usize,
     input: String,
     input_cur: usize,
     focus: Focus,
-    rule_sel: usize,
+    scenario_sel: usize,
     modal: Option<Modal>,
+    wizard: Option<Wizard>,
     status: String,
     status_until: Option<Instant>,
     should_quit: bool,
+    scenarios: Vec<Scenario>,
+    scenario_load_errors: Vec<ScenarioLoadError>,
+    runner: Option<RunnerHandle>,
+    samples: Vec<Sample>,
+    cur_step: Option<String>,
+    cur_scenario: Option<String>,
 }
 
 impl App {
@@ -238,29 +217,80 @@ impl App {
 
     fn new(config_path: Option<&str>) -> io::Result<Self> {
         let path = config_path.unwrap_or(DEFAULT_CFG).to_string();
-        let config = match core::load_config(&path) {
-            Ok(c) => c,
-            Err(_) => Config::default(),
+        let (config, config_existed) = match core::load_config(&path) {
+            Ok(c) => (c, true),
+            Err(_) => (Config::default(), false),
         };
+        let (ctrl, events) = SessionCtrl::new(config.clone());
         let mut app = Self {
             config,
             config_path: path,
-            session: None,
-            events: None,
+            ctrl,
+            events,
             log: VecDeque::new(),
             log_scroll: 0,
             input: String::new(),
             input_cur: 0,
             focus: Focus::Input,
-            rule_sel: 0,
+            scenario_sel: 0,
             modal: None,
+            wizard: None,
             status: String::new(),
             status_until: None,
             should_quit: false,
+            scenarios: Vec::new(),
+            scenario_load_errors: Vec::new(),
+            runner: None,
+            samples: Vec::new(),
+            cur_step: None,
+            cur_scenario: None,
         };
-        let msg = render_tpl1(app.tr().tpl_loaded_config, &app.config_path);
-        app.info(msg);
+        let need_wizard = !config_existed
+            || app.config.server_dir.as_deref().unwrap_or("").is_empty()
+            || app.config.server_cmd.is_empty();
+        app.reload_scenarios();
+        if need_wizard {
+            let selected = app.config.selected_scenarios.clone();
+            app.wizard = Some(Wizard::new(&app.config, &selected));
+        } else {
+            let msg = render_tpl1(app.tr().tpl_loaded_config, &app.config_path);
+            app.info(msg);
+        }
         Ok(app)
+    }
+
+    fn reload_scenarios(&mut self) {
+        let results = scenario::load_scenarios(&self.config.scenarios_dir);
+        self.scenarios.clear();
+        self.scenario_load_errors.clear();
+        let mut errors_to_log: Vec<String> = Vec::new();
+        for r in results {
+            match r {
+                Ok(s) => self.scenarios.push(s),
+                Err(e) => {
+                    errors_to_log.push(render_tpl2(
+                        self.tr().tpl_scenario_load_failed,
+                        &e.path.display().to_string(),
+                        &e.msg,
+                    ));
+                    self.scenario_load_errors.push(e);
+                }
+            }
+        }
+        if self.scenario_sel >= self.scenarios.len() {
+            self.scenario_sel = self.scenarios.len().saturating_sub(1);
+        }
+        if !self.scenarios.is_empty() {
+            let msg = render_tpl2(
+                self.tr().tpl_scenarios_loaded,
+                &self.config.scenarios_dir.display().to_string(),
+                &self.scenarios.len().to_string(),
+            );
+            self.push_log(LogKind::Info, msg);
+        }
+        for m in errors_to_log {
+            self.push_log(LogKind::Error, m);
+        }
     }
 
     fn push_log(&mut self, kind: LogKind, text: String) {
@@ -286,42 +316,106 @@ impl App {
     }
 
     fn drain_session(&mut self) {
-        let Some(rx) = &self.events else { return };
         let mut batch = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
+        while let Ok(ev) = self.events.try_recv() {
             batch.push(ev);
         }
         for ev in batch {
             match ev {
-                SEvent::Stdout(l) => self.push_log(LogKind::Out, l),
-                SEvent::Stderr(l) => self.push_log(LogKind::Err, l),
-                SEvent::RuleMatch {
-                    pattern,
-                    count,
-                    delay_ms,
-                    gap_ms,
-                } => self.push_log(
-                    LogKind::Rule,
-                    format!(
-                        "match /{pattern}/ -> {count} cmd(s) (delay {delay_ms}ms, gap {gap_ms}ms)"
-                    ),
-                ),
-                SEvent::RuleSent(c) => self.push_log(LogKind::Rule, format!("sent: {c}")),
+                SEvent::Stdout(l) => {
+                    if let Some(r) = &self.runner {
+                        r.feed_line(&l);
+                    }
+                    self.push_log(LogKind::Out, l);
+                }
+                SEvent::Stderr(l) => {
+                    if let Some(r) = &self.runner {
+                        r.feed_line(&l);
+                    }
+                    self.push_log(LogKind::Err, l);
+                }
                 SEvent::Exited(code) => {
-                    self.session = None;
-                    self.events = None;
+                    if let Some(r) = &self.runner {
+                        r.notify_exit();
+                    }
                     let msg = render_tpl1(
                         self.tr().tpl_server_exited,
                         &code.unwrap_or(-1).to_string(),
                     );
                     self.info(msg);
                 }
+                _ => {} // SessionCtrl only forwards server events; runner has its own channel
             }
         }
     }
 
+    fn drain_runner(&mut self) {
+        let events: Vec<SEvent> = match &self.runner {
+            Some(r) => {
+                let mut out = Vec::new();
+                while let Ok(ev) = r.events.try_recv() {
+                    out.push(ev);
+                }
+                out
+            }
+            None => return,
+        };
+        for ev in events {
+            match ev {
+                SEvent::ScenarioStart(name) => {
+                    self.cur_scenario = Some(name.clone());
+                    self.push_log(
+                        LogKind::Step,
+                        render_tpl1(self.tr().tpl_scenario_start, &name),
+                    );
+                }
+                SEvent::ScenarioDone { name, samples } => {
+                    self.cur_scenario = None;
+                    self.cur_step = None;
+                    let msg = render_tpl2(
+                        self.tr().tpl_scenario_done,
+                        &name,
+                        &samples.to_string(),
+                    );
+                    self.push_log(LogKind::Step, msg);
+                }
+                SEvent::StepStart(desc) => {
+                    self.cur_step = Some(desc.clone());
+                    self.push_log(LogKind::Step, render_tpl1(self.tr().tpl_step_start, &desc));
+                }
+                SEvent::StepDone(desc) => {
+                    self.push_log(LogKind::Step, render_tpl1(self.tr().tpl_step_done, &desc));
+                }
+                SEvent::Sample(sample) => {
+                    let text = sample
+                        .metrics
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.push_log(LogKind::Sample, render_tpl1(self.tr().tpl_sample, &text));
+                    self.samples.push(sample);
+                }
+                SEvent::RunnerInfo(msg) => {
+                    self.push_log(LogKind::Runner, render_tpl1(self.tr().tpl_runner_info, &msg));
+                }
+                SEvent::RunnerError(msg) => {
+                    self.push_log(LogKind::Runner, render_tpl1(self.tr().tpl_runner_error, &msg));
+                }
+                _ => {}
+            }
+        }
+        if let Some(r) = &self.runner
+            && r.is_done()
+        {
+            self.runner = None;
+            self.cur_scenario = None;
+            self.cur_step = None;
+        }
+    }
+
     fn start_server(&mut self) {
-        if self.session.is_some() {
+        if self.ctrl.is_running() {
             self.status(self.tr().server_already_running.into());
             return;
         }
@@ -329,33 +423,101 @@ impl App {
             self.error(self.tr().server_cmd_empty_hint.into());
             return;
         }
-        match Session::spawn(&self.config) {
-            Ok((s, rx)) => {
-                self.session = Some(s);
-                self.events = Some(rx);
+        match self.ctrl.start() {
+            Ok(StartOutcome::Started) => {
                 let cmd = self.config.server_cmd.join(" ");
                 let dir = self.config.server_dir.clone().unwrap_or_else(|| ".".into());
                 let msg = render_tpl2(self.tr().tpl_started_at, &cmd, &dir);
                 self.info(msg);
             }
+            Ok(StartOutcome::AlreadyRunning) => {
+                self.status(self.tr().server_already_running.into());
+            }
             Err(e) => {
-                let msg = render_tpl1(self.tr().tpl_spawn_failed, &e.to_string());
+                let msg = render_tpl1(self.tr().tpl_spawn_failed, &e);
                 self.error(msg);
             }
         }
     }
 
     fn stop_server(&mut self) {
-        match self.session.as_ref() {
-            Some(s) => {
-                if s.send_cmd("stop") {
-                    self.info(self.tr().sent_stop.into());
-                } else {
-                    self.error(self.tr().stdin_unavailable.into());
+        if !self.ctrl.is_running() {
+            self.status(self.tr().no_server_running.into());
+            return;
+        }
+        if self.ctrl.send_cmd("stop") {
+            self.info(self.tr().sent_stop.into());
+        } else {
+            self.error(self.tr().stdin_unavailable.into());
+        }
+    }
+
+    fn start_run(&mut self) {
+        if self.runner.is_some() {
+            self.status(self.tr().run_already_active.into());
+            return;
+        }
+        let picks: Vec<Scenario> = self
+            .scenarios
+            .iter()
+            .filter(|s| self.config.selected_scenarios.iter().any(|n| n == &s.name))
+            .cloned()
+            .collect();
+        if picks.is_empty() {
+            self.status(self.tr().run_no_selection.into());
+            return;
+        }
+        let n = picks.len();
+        let handle = runner::spawn(self.ctrl.clone(), picks);
+        self.runner = Some(handle);
+        let msg = render_tpl1(self.tr().tpl_run_started, &n.to_string());
+        self.info(msg);
+    }
+
+    fn export_samples(&mut self) {
+        if self.samples.is_empty() {
+            self.status(self.tr().no_samples_to_export.into());
+            return;
+        }
+        let label = self
+            .samples
+            .last()
+            .map(|s| s.scenario.clone())
+            .unwrap_or_else(|| "run".into());
+        match export::export_run(&self.config.results_dir, &label, &self.samples) {
+            Ok(art) => {
+                let msg = render_tpl2(
+                    self.tr().tpl_export_ok,
+                    &art.csv.display().to_string(),
+                    &art.json.display().to_string(),
+                );
+                self.info(msg);
+                let summary = export::summary_text(&self.samples);
+                self.push_log(LogKind::Sample, format!("{}:", self.tr().summary_title));
+                for line in summary.lines() {
+                    self.push_log(LogKind::Sample, line.to_string());
                 }
             }
-            None => self.status(self.tr().no_server_running.into()),
+            Err(e) => {
+                let msg = render_tpl1(self.tr().tpl_export_failed, &e.to_string());
+                self.error(msg);
+            }
         }
+    }
+
+    fn toggle_selected_scenario(&mut self) {
+        if self.scenario_sel >= self.scenarios.len() {
+            return;
+        }
+        let name = self.scenarios[self.scenario_sel].name.clone();
+        let pos = self.config.selected_scenarios.iter().position(|n| n == &name);
+        match pos {
+            Some(i) => {
+                self.config.selected_scenarios.remove(i);
+            }
+            None => self.config.selected_scenarios.push(name),
+        }
+        self.autosave();
     }
 
     fn send_input(&mut self) {
@@ -365,39 +527,26 @@ impl App {
             return;
         }
         if line == ":quit" {
-            if let Some(s) = &self.session {
-                s.close_stdin();
+            if self.ctrl.is_running() {
+                self.ctrl.close_stdin();
                 self.info(self.tr().closed_server_stdin.into());
             }
             return;
         }
-        match self.session.as_ref() {
-            Some(s) => {
-                if !s.send_cmd(&line) {
-                    self.error(self.tr().stdin_unavailable.into());
-                }
-            }
-            None => self.error(self.tr().no_server_hint.into()),
+        if !self.ctrl.is_running() {
+            self.error(self.tr().no_server_hint.into());
+            return;
+        }
+        if !self.ctrl.send_cmd(&line) {
+            self.error(self.tr().stdin_unavailable.into());
         }
     }
 
     fn autosave(&mut self) {
+        self.ctrl.update_config(self.config.clone());
         if let Err(e) = core::save_config(&self.config_path, &self.config) {
             let msg = render_tpl1(self.tr().tpl_save_failed, &e.to_string());
             self.error(msg);
-        }
-    }
-
-    fn delete_rule(&mut self) {
-        if self.rule_sel < self.config.rules.len() {
-            let pat = self.config.rules[self.rule_sel].pattern.clone();
-            self.config.rules.remove(self.rule_sel);
-            if self.rule_sel >= self.config.rules.len() && self.rule_sel > 0 {
-                self.rule_sel -= 1;
-            }
-            let msg = render_tpl1(self.tr().tpl_deleted_rule, &pat);
-            self.info(msg);
-            self.autosave();
         }
     }
 
@@ -413,6 +562,7 @@ impl App {
         let tick = Duration::from_millis(80);
         while !self.should_quit {
             self.drain_session();
+            self.drain_runner();
             terminal.draw(|f| draw(f, self))?;
             if event::poll(tick)? {
                 match event::read()? {
@@ -420,20 +570,35 @@ impl App {
                     _ => {}
                 }
             }
-            if let Some(deadline) = self.status_until {
-                if Instant::now() >= deadline {
-                    self.status.clear();
-                    self.status_until = None;
-                }
+            if let Some(deadline) = self.status_until
+                && Instant::now() >= deadline
+            {
+                self.status.clear();
+                self.status_until = None;
             }
         }
-        if let Some(s) = &self.session {
-            let _ = s.send_cmd("stop");
+        if let Some(r) = &self.runner {
+            r.request_stop();
+        }
+        if self.ctrl.is_running() {
+            let _ = self.ctrl.send_cmd("stop");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline && self.ctrl.is_running() {
+                if matches!(self.events.try_recv(), Ok(SEvent::Exited(_))) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            self.ctrl.kill();
         }
         Ok(())
     }
 
     fn handle_key(&mut self, k: KeyEvent) {
+        if self.wizard.is_some() {
+            self.handle_wizard_key(k);
+            return;
+        }
         if self.modal.is_some() {
             self.handle_modal_key(k);
             return;
@@ -448,7 +613,7 @@ impl App {
             match k.code {
                 KeyCode::Esc => self.focus = Focus::Log,
                 KeyCode::Enter => self.send_input(),
-                KeyCode::Tab => self.focus = Focus::Rules,
+                KeyCode::Tab => self.focus = Focus::Scenarios,
                 KeyCode::Left => {
                     if self.input_cur > 0 {
                         self.input_cur -= prev_char_len(&self.input, self.input_cur);
@@ -489,8 +654,8 @@ impl App {
         match k.code {
             KeyCode::Tab => {
                 self.focus = match self.focus {
-                    Focus::Input => Focus::Rules,
-                    Focus::Rules => Focus::Log,
+                    Focus::Input => Focus::Scenarios,
+                    Focus::Scenarios => Focus::Log,
                     Focus::Log => Focus::Input,
                 };
             }
@@ -498,57 +663,22 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('s') => self.start_server(),
             KeyCode::Char('S') => self.stop_server(),
-            KeyCode::Char('a') => {
-                self.modal = Some(Modal::RuleForm(RuleForm::new_blank()));
-            }
-            KeyCode::Char('e') => {
-                if self.config.rules.is_empty() {
-                    self.status(self.tr().no_rules_to_edit.into());
-                } else if self.rule_sel < self.config.rules.len() {
-                    let r = self.config.rules[self.rule_sel].clone();
-                    self.modal = Some(Modal::RuleForm(RuleForm::new(Some(self.rule_sel), &r)));
+            KeyCode::Char('r') => self.start_run(),
+            KeyCode::Char('x') => self.export_samples(),
+            KeyCode::Char(' ') => {
+                if self.focus == Focus::Scenarios {
+                    self.toggle_selected_scenario();
                 }
             }
-            KeyCode::Char('d') => {
-                if self.config.rules.is_empty() {
-                    self.status(self.tr().no_rules_to_delete.into());
-                } else {
-                    self.delete_rule();
-                }
-            }
-            KeyCode::Char('j') => {
-                if self.focus != Focus::Input && self.rule_sel + 1 < self.config.rules.len() {
-                    self.rule_sel += 1;
-                }
-            }
-            KeyCode::Char('k') => {
-                if self.focus != Focus::Input && self.rule_sel > 0 {
-                    self.rule_sel -= 1;
-                }
-            }
+            KeyCode::Char('j') => self.nav_down(),
+            KeyCode::Char('k') => self.nav_up(),
             KeyCode::Char('c') => {
                 self.modal = Some(Modal::ConfigForm(ConfigForm::new(&self.config)));
             }
             KeyCode::Char('L') => self.toggle_lang(),
             KeyCode::Char('?') => self.modal = Some(Modal::Help),
-            KeyCode::Up => match self.focus {
-                Focus::Rules => {
-                    if self.rule_sel > 0 {
-                        self.rule_sel -= 1;
-                    }
-                }
-                Focus::Log => self.log_scroll = self.log_scroll.saturating_add(1),
-                _ => {}
-            },
-            KeyCode::Down => match self.focus {
-                Focus::Rules => {
-                    if self.rule_sel + 1 < self.config.rules.len() {
-                        self.rule_sel += 1;
-                    }
-                }
-                Focus::Log => self.log_scroll = self.log_scroll.saturating_sub(1),
-                _ => {}
-            },
+            KeyCode::Up => self.nav_up(),
+            KeyCode::Down => self.nav_down(),
             KeyCode::PageUp => {
                 if self.focus == Focus::Log {
                     self.log_scroll = self.log_scroll.saturating_add(10);
@@ -573,69 +703,36 @@ impl App {
         }
     }
 
+    fn nav_up(&mut self) {
+        match self.focus {
+            Focus::Scenarios => {
+                if self.scenario_sel > 0 {
+                    self.scenario_sel -= 1;
+                }
+            }
+            Focus::Log => self.log_scroll = self.log_scroll.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    fn nav_down(&mut self) {
+        match self.focus {
+            Focus::Scenarios => {
+                if self.scenario_sel + 1 < self.scenarios.len() {
+                    self.scenario_sel += 1;
+                }
+            }
+            Focus::Log => self.log_scroll = self.log_scroll.saturating_sub(1),
+            _ => {}
+        }
+    }
+
     fn handle_modal_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self.modal.as_mut() {
             Some(Modal::Error(_)) | Some(Modal::Help) => {
                 if matches!(k.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     self.modal = None;
-                }
-            }
-            Some(Modal::RuleForm(f)) => {
-                if k.code == KeyCode::Esc {
-                    self.modal = None;
-                    return;
-                }
-                if ctrl && k.code == KeyCode::Char('s') {
-                    let lang = self.config.lang;
-                    match f.to_rule(lang) {
-                        Ok(r) => {
-                            match f.editing {
-                                Some(i) => self.config.rules[i] = r,
-                                None => self.config.rules.push(r),
-                            }
-                            self.modal = None;
-                            self.info(self.tr().rule_saved_hint.into());
-                            self.autosave();
-                        }
-                        Err(e) => self.modal = Some(Modal::Error(e)),
-                    }
-                    return;
-                }
-                if k.code == KeyCode::Tab {
-                    f.field = (f.field + 1) % RULE_FORM_FIELDS;
-                    return;
-                }
-                if k.code == KeyCode::BackTab {
-                    f.field = (f.field + RULE_FORM_FIELDS - 1) % RULE_FORM_FIELDS;
-                    return;
-                }
-                match f.field {
-                    0 => edit_single(&mut f.pattern, &mut f.pat_cur, k),
-                    1 => match k.code {
-                        KeyCode::Left | KeyCode::Char('h') => {
-                            let i = mode_index(f.match_mode);
-                            f.match_mode = MATCH_MODES[(i + MATCH_MODES.len() - 1) % MATCH_MODES.len()];
-                        }
-                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(' ') => {
-                            let i = mode_index(f.match_mode);
-                            f.match_mode = MATCH_MODES[(i + 1) % MATCH_MODES.len()];
-                        }
-                        KeyCode::Char('1') => f.match_mode = MatchMode::Contains,
-                        KeyCode::Char('2') => f.match_mode = MatchMode::Exact,
-                        KeyCode::Char('3') => f.match_mode = MatchMode::Glob,
-                        KeyCode::Char('4') => f.match_mode = MatchMode::Regex,
-                        _ => {}
-                    },
-                    2 => edit_multi(&mut f.commands, &mut f.cmd_cur, k),
-                    3 => {
-                        if matches!(k.code, KeyCode::Char(' ') | KeyCode::Enter) {
-                            f.once = !f.once;
-                        }
-                    }
-                    4 => edit_digits(&mut f.delay_ms, &mut f.d_cur, k),
-                    5 => edit_digits(&mut f.gap_ms, &mut f.g_cur, k),
-                    _ => {}
                 }
             }
             Some(Modal::ConfigForm(f)) => {
@@ -648,27 +745,152 @@ impl App {
                     let lang = self.config.lang;
                     match f.apply(&mut cfg, lang) {
                         Ok(()) => {
+                            let scenarios_changed = cfg.scenarios_dir != self.config.scenarios_dir;
                             self.config = cfg;
                             self.modal = None;
                             self.info(self.tr().config_updated_hint.into());
                             self.autosave();
+                            if scenarios_changed {
+                                self.reload_scenarios();
+                            }
                         }
                         Err(e) => self.modal = Some(Modal::Error(e)),
                     }
                     return;
                 }
-                if k.code == KeyCode::Tab || k.code == KeyCode::BackTab {
-                    f.field = 1 - f.field;
+                if k.code == KeyCode::Tab {
+                    f.field = (f.field + 1) % CONFIG_FORM_FIELDS;
                     return;
                 }
-                match f.field {
-                    0 => edit_single(&mut f.server_dir, &mut f.dir_cur, k),
-                    1 => edit_single(&mut f.server_cmd, &mut f.cmd_cur, k),
-                    _ => {}
+                if k.code == KeyCode::BackTab {
+                    f.field = (f.field + CONFIG_FORM_FIELDS - 1) % CONFIG_FORM_FIELDS;
+                    return;
                 }
+                let (buf, cur) = f.field_buf_mut();
+                edit_single(buf, cur, k);
             }
             None => {}
         }
+    }
+
+    fn handle_wizard_key(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && k.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        let Some(w) = self.wizard.as_mut() else {
+            return;
+        };
+        if k.code == KeyCode::Esc {
+            // skip wizard, use whatever defaults are in place
+            self.wizard = None;
+            let msg = render_tpl1(self.tr().tpl_loaded_config, &self.config_path);
+            self.info(msg);
+            return;
+        }
+        match w.page {
+            0 => {
+                if k.code == KeyCode::Enter {
+                    w.page = 1;
+                }
+            }
+            1 => match k.code {
+                KeyCode::Enter => {
+                    let dir = w.dir_buf.trim();
+                    if !dir.is_empty() && !Path::new(dir).is_dir() {
+                        self.modal =
+                            Some(Modal::Error(self.tr().err_server_dir_missing.into()));
+                        return;
+                    }
+                    w.page = 2;
+                }
+                _ => edit_single(&mut w.dir_buf, &mut w.dir_cur, k),
+            },
+            2 => {
+                if k.code == KeyCode::Enter {
+                    if shell_split(&w.cmd_buf).is_empty() {
+                        self.modal =
+                            Some(Modal::Error(self.tr().err_server_cmd_empty.into()));
+                        return;
+                    }
+                    w.page = 3;
+                    return;
+                }
+                if k.code == KeyCode::Tab {
+                    w.cmd_edit_focus = !w.cmd_edit_focus;
+                    return;
+                }
+                if !w.cmd_edit_focus {
+                    match k.code {
+                        KeyCode::Up => {
+                            if w.preset_idx > 0 {
+                                w.preset_idx -= 1;
+                                w.cmd_buf = PRESETS[w.preset_idx].cmd.to_string();
+                                w.cmd_cur = w.cmd_buf.len();
+                            }
+                        }
+                        KeyCode::Down => {
+                            if w.preset_idx + 1 < PRESETS.len() {
+                                w.preset_idx += 1;
+                                w.cmd_buf = PRESETS[w.preset_idx].cmd.to_string();
+                                w.cmd_cur = w.cmd_buf.len();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            // typing switches to cmd edit
+                            w.cmd_edit_focus = true;
+                            let mut buf = [0u8; 4];
+                            let s = c.encode_utf8(&mut buf);
+                            w.cmd_buf.insert_str(w.cmd_cur, s);
+                            w.cmd_cur += s.len();
+                        }
+                        _ => {}
+                    }
+                } else {
+                    edit_single(&mut w.cmd_buf, &mut w.cmd_cur, k);
+                }
+            }
+            3 => match k.code {
+                KeyCode::Up => {
+                    if w.scenario_sel > 0 {
+                        w.scenario_sel -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if w.scenario_sel + 1 < self.scenarios.len() {
+                        w.scenario_sel += 1;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(sc) = self.scenarios.get(w.scenario_sel)
+                        && !w.scenario_selected.remove(&sc.name)
+                    {
+                        w.scenario_selected.insert(sc.name.clone());
+                    }
+                }
+                KeyCode::Enter => {
+                    self.finish_wizard();
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    fn finish_wizard(&mut self) {
+        let Some(w) = self.wizard.take() else { return };
+        self.config.server_dir = if w.dir_buf.trim().is_empty() {
+            None
+        } else {
+            Some(w.dir_buf.trim().to_string())
+        };
+        self.config.server_cmd = shell_split(&w.cmd_buf);
+        self.config.selected_scenarios = w.scenario_selected.into_iter().collect();
+        self.config.selected_scenarios.sort();
+        self.autosave();
+        let msg = render_tpl1(self.tr().tpl_loaded_config, &self.config_path);
+        self.info(msg);
     }
 }
 
@@ -717,23 +939,6 @@ fn edit_single(buf: &mut String, cur: &mut usize, k: KeyEvent) {
     }
 }
 
-fn edit_multi(buf: &mut String, cur: &mut usize, k: KeyEvent) {
-    match k.code {
-        KeyCode::Enter => {
-            buf.insert(*cur, '\n');
-            *cur += 1;
-        }
-        _ => edit_single(buf, cur, k),
-    }
-}
-
-fn edit_digits(buf: &mut String, cur: &mut usize, k: KeyEvent) {
-    match k.code {
-        KeyCode::Char(c) if !c.is_ascii_digit() => {}
-        _ => edit_single(buf, cur, k),
-    }
-}
-
 fn setup_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     let mut out = stdout();
@@ -779,12 +984,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     draw_input(f, root[2], app);
     draw_hints(f, root[3], app);
 
-    if let Some(m) = &app.modal {
+    if let Some(w) = &app.wizard {
+        draw_wizard(f, area, w, app);
+    } else if let Some(m) = &app.modal {
         let l = app.tr();
         match m {
             Modal::Help => draw_help(f, area, l),
             Modal::Error(msg) => draw_error(f, area, msg, l),
-            Modal::RuleForm(form) => draw_rule_form(f, area, form, l),
             Modal::ConfigForm(form) => draw_config_form(f, area, form, l),
         }
     }
@@ -792,7 +998,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
 
 fn draw_title(f: &mut ratatui::Frame, area: Rect, app: &App) {
     let l = app.tr();
-    let running = if app.session.is_some() {
+    let running = if app.ctrl.is_running() {
         Span::styled(l.running.to_string(), Style::default().fg(Color::Green))
     } else {
         Span::styled(l.stopped.to_string(), Style::default().fg(Color::DarkGray))
@@ -828,9 +1034,22 @@ fn draw_left(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let l = app.tr();
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(3)])
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(8),
+        ])
         .split(area);
 
+    draw_server_panel(f, rows[0], app);
+    draw_scenarios_panel(f, rows[1], app);
+    draw_progress_panel(f, rows[2], app);
+
+    let _ = l; // silence if unused
+}
+
+fn draw_server_panel(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let l = app.tr();
     let dir = app
         .config
         .server_dir
@@ -861,57 +1080,54 @@ fn draw_left(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .title(l.server_panel.to_string()),
         ),
-        rows[0],
+        area,
     );
+}
 
-    let rules_focused = app.focus == Focus::Rules;
-    let items: Vec<ListItem> = app
-        .config
-        .rules
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let head = Line::from(vec![
-                Span::styled(format!("{i:>2} "), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} ", mode_label(r.match_mode)),
-                    Style::default().fg(Color::Yellow),
-                ),
-                Span::styled(
-                    format!("{:?}", r.pattern),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::raw(if r.once {
-                    format!("  {}", l.once_tag)
-                } else {
-                    String::new()
-                }),
-            ]);
-            let tail = Line::from(vec![
-                Span::styled("   -> ", Style::default().fg(Color::DarkGray)),
-                Span::raw(r.commands.join(" ; ")),
-            ]);
-            let meta = if r.delay_ms > 0 || r.gap_ms > 0 {
-                Some(Line::from(Span::styled(
-                    format!("   delay {}ms, gap {}ms", r.delay_ms, r.gap_ms),
-                    Style::default().fg(Color::DarkGray),
-                )))
-            } else {
-                None
-            };
-            let mut v = vec![head, tail];
-            if let Some(m) = meta {
-                v.push(m);
-            }
-            ListItem::new(v)
-        })
-        .collect();
-    let title = render_tpl1(l.rules_title, &app.config.rules.len().to_string());
-    let border_style = if rules_focused {
+fn draw_scenarios_panel(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let l = app.tr();
+    let focused = app.focus == Focus::Scenarios;
+    let border_style = if focused {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let title = render_tpl1(l.scenarios_title, &app.scenarios.len().to_string());
+    if app.scenarios.is_empty() && app.scenario_load_errors.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                l.no_scenarios_loaded.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(title),
+            ),
+            area,
+        );
+        return;
+    }
+    let selected: Vec<String> = app.config.selected_scenarios.clone();
+    let items: Vec<ListItem> = app
+        .scenarios
+        .iter()
+        .map(|s| {
+            let is_sel = selected.iter().any(|n| n == &s.name);
+            let mark = if is_sel { l.selected_tag } else { "[ ]" };
+            let color = if is_sel { Color::Green } else { Color::DarkGray };
+            let line = Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(s.name.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("  ({} steps)", s.steps.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
     let list = List::new(items)
         .block(
             Block::default()
@@ -925,12 +1141,118 @@ fn draw_left(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         )
         .highlight_symbol("> ");
-
     let mut state = ListState::default();
-    if !app.config.rules.is_empty() {
-        state.select(Some(app.rule_sel.min(app.config.rules.len() - 1)));
+    if !app.scenarios.is_empty() {
+        state.select(Some(app.scenario_sel.min(app.scenarios.len() - 1)));
     }
-    f.render_stateful_widget(list, rows[1], &mut state);
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_progress_panel(f: &mut ratatui::Frame, area: Rect, app: &App) {
+    let l = app.tr();
+    let progress = app
+        .runner
+        .as_ref()
+        .map(|r| r.progress())
+        .unwrap_or_default();
+
+    // inner width minus 2 border chars, reserve 10 chars for trailing "  100%"
+    let bar_w = (area.width as usize).saturating_sub(2 + 10).max(8);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    match &progress.scenario {
+        Some(sp) => {
+            body.push(Line::from(vec![
+                Span::styled("▶ ", Style::default().fg(Color::Green)),
+                Span::styled(sp.name.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" ({}/{})", sp.index, sp.total),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            if let Some(st) = &progress.step {
+                body.push(Line::from(vec![
+                    Span::styled(
+                        format!("step {}/{}: ", st.index, st.total),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(st.desc.clone(), Style::default().fg(Color::Yellow)),
+                ]));
+                let frac = if st.total == 0 {
+                    0.0
+                } else {
+                    st.index as f32 / st.total as f32
+                };
+                body.push(bar_line(frac, bar_w, Color::Cyan));
+            }
+            if let Some(li) = &progress.loop_info {
+                let elapsed = Instant::now().saturating_duration_since(li.started_at);
+                let elapsed = elapsed.min(li.total);
+                let frac = if li.total.as_millis() == 0 {
+                    1.0
+                } else {
+                    elapsed.as_millis() as f32 / li.total.as_millis() as f32
+                };
+                body.push(Line::from(vec![
+                    Span::styled(
+                        format!("loop iter {} · ", li.iter),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{}/{}", fmt_dur_brief(elapsed), fmt_dur_brief(li.total)),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]));
+                body.push(bar_line(frac, bar_w, Color::Magenta));
+            }
+        }
+        None => {
+            body.push(Line::from(Span::styled(
+                l.progress_idle.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+    }
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(l.progress_title.to_string()),
+        ),
+        area,
+    );
+}
+
+fn bar_line(frac: f32, width: usize, color: Color) -> Line<'static> {
+    let frac = frac.clamp(0.0, 1.0);
+    let filled = ((frac * width as f32).round() as usize).min(width);
+    let empty = width - filled;
+    let pct = (frac * 100.0).round() as u32;
+    Line::from(vec![
+        Span::styled("█".repeat(filled), Style::default().fg(color)),
+        Span::styled(
+            "░".repeat(empty),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {pct:>3}%"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn fmt_dur_brief(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms >= 60_000 {
+        let s = ms / 1000;
+        format!("{}m{:02}s", s / 60, s % 60)
+    } else if ms >= 1000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 fn draw_log(f: &mut ratatui::Frame, area: Rect, app: &App) {
@@ -974,9 +1296,11 @@ fn wrap_log_line(l: &LogLine, width: usize) -> Vec<Line<'static>> {
     let (tag, color) = match l.kind {
         LogKind::Out => ("[OUT] ", Color::White),
         LogKind::Err => ("[ERR] ", Color::Red),
-        LogKind::Rule => ("[RULE] ", Color::Magenta),
         LogKind::Info => ("[observer] ", Color::Cyan),
         LogKind::Error => ("[observer ERR] ", Color::Red),
+        LogKind::Step => ("[STEP] ", Color::Yellow),
+        LogKind::Sample => ("[SAMPLE] ", Color::Green),
+        LogKind::Runner => ("[RUN] ", Color::Magenta),
     };
     let tag_w = tag.chars().count();
     if width <= tag_w + 1 {
@@ -1022,7 +1346,7 @@ fn draw_input(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
     let l = app.tr();
-    let title = if app.session.is_some() {
+    let title = if app.ctrl.is_running() {
         l.send_active
     } else {
         l.send_inactive
@@ -1046,9 +1370,9 @@ fn draw_hints(f: &mut ratatui::Frame, area: Rect, app: &App) {
         hint("s", l.hint_start),
         hint("S", l.hint_stop),
         hint("c", l.hint_config),
-        hint("a", l.hint_add),
-        hint("e", l.hint_edit),
-        hint("d", l.hint_delete),
+        hint("r", l.hint_run),
+        hint("␣", l.hint_toggle),
+        hint("x", l.hint_export),
         hint("i", l.hint_input),
         hint("Tab", l.hint_focus),
         hint("L", l.hint_lang),
@@ -1078,7 +1402,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 fn draw_help(f: &mut ratatui::Frame, area: Rect, l: &L10n) {
     let h = (l.help_body.len() as u16 + 4).min(area.height);
-    let r = centered(area, 60, h);
+    let r = centered(area, 64, h);
     f.render_widget(Clear, r);
     let mut text: Vec<Line<'static>> =
         l.help_body.iter().map(|s| Line::from(s.to_string())).collect();
@@ -1116,119 +1440,57 @@ fn draw_error(f: &mut ratatui::Frame, area: Rect, msg: &str, l: &L10n) {
     );
 }
 
-fn draw_rule_form(f: &mut ratatui::Frame, area: Rect, form: &RuleForm, l: &L10n) {
-    let r = centered(area, 84, 24);
+fn draw_config_form(f: &mut ratatui::Frame, area: Rect, form: &ConfigForm, l: &L10n) {
+    let r = centered(area, 80, 16);
     f.render_widget(Clear, r);
-    let title = match form.editing {
-        Some(i) => render_tpl1(l.edit_rule_title, &i.to_string()),
-        None => l.add_rule_title.to_string(),
-    };
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title(title)
-            .style(Style::default().fg(Color::White)),
+            .title(l.config_form_title.to_string()),
         r,
     );
-
     let inner = Rect {
         x: r.x + 1,
         y: r.y + 1,
         width: r.width - 2,
         height: r.height - 2,
     };
-
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // 0 pattern
-            Constraint::Length(3), // 1 match mode
-            Constraint::Min(4),    // 2 commands
-            Constraint::Length(1), // 3 once
-            Constraint::Length(3), // 4 delay
-            Constraint::Length(3), // 5 gap
-            Constraint::Length(1), // hint
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(inner);
-
-    let pattern_title = render_tpl1(l.pattern_field, mode_label(form.match_mode));
-    field_box(f, rows[0], &pattern_title, &form.pattern, form.field == 0);
-    draw_mode_picker(f, rows[1], form.match_mode, form.field == 1, l);
-    field_box_multi(f, rows[2], l.commands_field, &form.commands, form.field == 2);
-    let once_style = if form.field == 3 {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(l.once_prompt.to_string(), Style::default().fg(Color::DarkGray)),
-            Span::styled(if form.once { "[x]" } else { "[ ]" }, once_style),
-        ])),
-        rows[3],
+    field_box(f, rows[0], l.server_dir_field, &form.server_dir, form.field == 0);
+    field_box(f, rows[1], l.server_cmd_field, &form.server_cmd, form.field == 1);
+    field_box(
+        f,
+        rows[2],
+        l.scenarios_dir_field,
+        &form.scenarios_dir,
+        form.field == 2,
     );
-    field_box(f, rows[4], l.delay_field, &form.delay_ms, form.field == 4);
-    field_box(f, rows[5], l.gap_field, &form.gap_ms, form.field == 5);
+    field_box(f, rows[3], l.results_dir_field, &form.results_dir, form.field == 3);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            l.rule_form_hint.to_string(),
+            l.config_form_hint.to_string(),
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[6],
+        rows[5],
     );
-
-    set_form_cursor(f, form, &rows);
-}
-
-fn draw_mode_picker(f: &mut ratatui::Frame, area: Rect, mode: MatchMode, focused: bool, l: &L10n) {
-    let border = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let (buf, cur) = match form.field {
+        0 => (&form.server_dir, form.cur[0]),
+        1 => (&form.server_cmd, form.cur[1]),
+        2 => (&form.scenarios_dir, form.cur[2]),
+        3 => (&form.results_dir, form.cur[3]),
+        _ => return,
     };
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for m in MATCH_MODES {
-        let selected = m == mode;
-        let s = if selected {
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(format!(" {} ", mode_label(m)), s));
-        spans.push(Span::raw(" "));
-    }
-    let help = match mode {
-        MatchMode::Contains => l.mode_help_contains,
-        MatchMode::Exact => l.mode_help_exact,
-        MatchMode::Glob => l.mode_help_glob,
-        MatchMode::Regex => l.mode_help_regex,
-    };
-    spans.push(Span::styled(
-        format!("— {}", help),
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-    ));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border)
-                .title(l.mode_picker_title.to_string()),
-        ),
-        area,
-    );
-}
-
-fn set_form_cursor(f: &mut ratatui::Frame, form: &RuleForm, rows: &[Rect]) {
-    match form.field {
-        0 => place_cursor(f, rows[0], &form.pattern, form.pat_cur),
-        2 => place_cursor_multi(f, rows[2], &form.commands, form.cmd_cur),
-        4 => place_cursor(f, rows[4], &form.delay_ms, form.d_cur),
-        5 => place_cursor(f, rows[5], &form.gap_ms, form.g_cur),
-        _ => {}
-    }
+    place_cursor(f, rows[form.field], buf, cur);
 }
 
 fn field_box(f: &mut ratatui::Frame, area: Rect, title: &str, text: &str, focus: bool) {
@@ -1248,53 +1510,23 @@ fn field_box(f: &mut ratatui::Frame, area: Rect, title: &str, text: &str, focus:
     );
 }
 
-fn field_box_multi(f: &mut ratatui::Frame, area: Rect, title: &str, text: &str, focus: bool) {
-    let border = if focus {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    f.render_widget(
-        Paragraph::new(text.to_string()).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border)
-                .title(title.to_string()),
-        ),
-        area,
-    );
-}
-
 fn place_cursor(f: &mut ratatui::Frame, area: Rect, text: &str, byte_idx: usize) {
     let visible = &text[..byte_idx.min(text.len())];
     let col = area.x + 1 + visible.chars().count() as u16;
     f.set_cursor_position((col.min(area.x + area.width - 2), area.y + 1));
 }
 
-fn place_cursor_multi(f: &mut ratatui::Frame, area: Rect, text: &str, byte_idx: usize) {
-    let before = &text[..byte_idx.min(text.len())];
-    let mut row = 0u16;
-    let mut col = 0u16;
-    for c in before.chars() {
-        if c == '\n' {
-            row += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    let max_x = area.x + area.width - 2;
-    let max_y = area.y + area.height - 2;
-    f.set_cursor_position(((area.x + 1 + col).min(max_x), (area.y + 1 + row).min(max_y)));
-}
-
-fn draw_config_form(f: &mut ratatui::Frame, area: Rect, form: &ConfigForm, l: &L10n) {
-    let r = centered(area, 80, 12);
+fn draw_wizard(f: &mut ratatui::Frame, area: Rect, w: &Wizard, app: &App) {
+    let l = app.tr();
+    let r = centered(area, 80, 22);
     f.render_widget(Clear, r);
+    let title = format!(
+        "{} — {}/4",
+        l.wizard_title,
+        w.page + 1
+    );
     f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(l.config_form_title.to_string()),
+        Block::default().borders(Borders::ALL).title(title),
         r,
     );
     let inner = Rect {
@@ -1305,25 +1537,156 @@ fn draw_config_form(f: &mut ratatui::Frame, area: Rect, form: &ConfigForm, l: &L
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(inner);
-    field_box(f, rows[0], l.server_dir_field, &form.server_dir, form.field == 0);
-    field_box(f, rows[1], l.server_cmd_field, &form.server_cmd, form.field == 1);
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            l.config_form_hint.to_string(),
-            Style::default().fg(Color::DarkGray),
-        ))),
-        rows[3],
-    );
-    match form.field {
-        0 => place_cursor(f, rows[0], &form.server_dir, form.dir_cur),
-        1 => place_cursor(f, rows[1], &form.server_cmd, form.cmd_cur),
+    match w.page {
+        0 => {
+            let lines: Vec<Line<'static>> = l
+                .wizard_welcome
+                .iter()
+                .map(|s| Line::from(s.to_string()))
+                .collect();
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
+        }
+        1 => {
+            let sub = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Min(1),
+                ])
+                .split(rows[0]);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    l.wizard_dir_hint.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                sub[0],
+            );
+            field_box(f, sub[1], l.wizard_dir_title, &w.dir_buf, true);
+            place_cursor(f, sub[1], &w.dir_buf, w.dir_cur);
+        }
+        2 => {
+            let sub = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length((PRESETS.len() as u16) + 2),
+                    Constraint::Length(3),
+                    Constraint::Min(0),
+                ])
+                .split(rows[0]);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    l.wizard_cmd_hint.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                sub[0],
+            );
+            let preset_items: Vec<ListItem> = PRESETS
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let prefix = if i == w.preset_idx { "▶ " } else { "  " };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(p.label, Style::default().fg(Color::Cyan)),
+                        Span::raw(format!("  {}", p.cmd)),
+                    ]))
+                })
+                .collect();
+            let preset_border = if !w.cmd_edit_focus {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            f.render_widget(
+                List::new(preset_items).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(preset_border)
+                        .title(l.wizard_preset_title.to_string()),
+                ),
+                sub[1],
+            );
+            field_box(f, sub[2], l.wizard_cmd_title, &w.cmd_buf, w.cmd_edit_focus);
+            if w.cmd_edit_focus {
+                place_cursor(f, sub[2], &w.cmd_buf, w.cmd_cur);
+            }
+        }
+        3 => {
+            let sub = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(rows[0]);
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    l.wizard_scenarios_hint.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                sub[0],
+            );
+            if app.scenarios.is_empty() {
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        l.wizard_scenarios_empty.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    )))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(l.wizard_scenarios_title.to_string()),
+                    ),
+                    sub[1],
+                );
+            } else {
+                let items: Vec<ListItem> = app
+                    .scenarios
+                    .iter()
+                    .map(|s| {
+                        let is_sel = w.scenario_selected.contains(&s.name);
+                        let mark = if is_sel { "[x]" } else { "[ ]" };
+                        let color = if is_sel { Color::Green } else { Color::DarkGray };
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!("{mark} "), Style::default().fg(color)),
+                            Span::styled(s.name.clone(), Style::default().fg(Color::Cyan)),
+                            Span::styled(
+                                format!("  ({} steps)", s.steps.len()),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]))
+                    })
+                    .collect();
+                let list = List::new(items)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(l.wizard_scenarios_title.to_string()),
+                    )
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("> ");
+                let mut state = ListState::default();
+                state.select(Some(w.scenario_sel.min(app.scenarios.len() - 1)));
+                f.render_stateful_widget(list, sub[1], &mut state);
+            }
+        }
         _ => {}
     }
+    let hint = if w.page == 3 {
+        l.wizard_finish_hint
+    } else {
+        l.wizard_nav_hint
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint.to_string(),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
 }
